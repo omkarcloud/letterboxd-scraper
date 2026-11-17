@@ -40,18 +40,11 @@ vary — many pass every path, some are challenged. So the ladder is:
      sticky exit, or direct when None);
   2. proxied: rotate to a fresh exit per challenge, up to
      config.LETTERBOXD_ROTATE_ATTEMPTS;
-  3. mint ONE identity with a headed patchright Chrome on the current
-     egress, seeded on the challenged path (boomplay pattern: real mouse
-     click on the Turnstile checkbox; validated 2026-09-19 on a challenged
-     residential US exit from a Mac — 2 clicks, 44 s), wait for
-     cf_clearance and replay its cookies + user-agent over curl_cffi. A
-     failed harvest backs off for config.LETTERBOXD_HARVEST_COOLDOWN
-     seconds so Chrome is not relaunched on every request.
-config.LETTERBOXD_CF_FALLBACK turns step 3 off.
+and a challenge that survives the ladder raises LetterboxdBlocked.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   LetterboxdUpstreamError  transport failure / 5xx            — retried
-  LetterboxdBlocked        challenge that survived a fresh identity
+  LetterboxdBlocked        challenge that survived every exit
   LetterboxdBadRequest     upstream rejected the params        — never retried
   LetterboxdNotFound       404 / private / unknown member etc. — never retried
 """
@@ -67,9 +60,11 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 
 from letterboxd import refs
+from scraper_utils import debug, fanout, sessions
 
 SITE = refs.SITE
 IMPERSONATE = "chrome"
@@ -82,18 +77,14 @@ RESOLVE_MEMO_TTL = 7 * 86400       # boxd.it / imdb / tmdb -> path never changes
 
 CF_MARKERS = ("just a moment", "cf-chl", "challenge-platform", "cf_chl_opt",
               "performing security verification", "attention required! | cloudflare")
-HARVEST_CLEAR_TIMEOUT = 75
-HARVEST_POLL = 1.0
-CLICK_EVERY = 15
-MAX_CLICKS = 3
 
 HTML_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("letterboxd"),
 }
 AJAX_HEADERS = {
     "accept": "application/json, text/javascript, text/html, */*; q=0.01",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("letterboxd"),
     "x-requested-with": "XMLHttpRequest",
     "referer": SITE + "/",
 }
@@ -116,11 +107,10 @@ class LetterboxdNotFound(NotFound):
 
 
 # ---- egress + sessions ---------------------------------------------------------------
-# ONE egress for the whole process (direct by default): a Cloudflare
-# identity is bound to the IP it was minted on, so the harvest browser and
-# every replaying curl session must share it. rotate_egress() picks a new
-# sticky exit (only meaningful with config.LETTERBOXD_PROXY_COUNTRY) and
-# bumps the version so thread-local sessions rebuild.
+# ONE egress for the whole process (direct by default). rotate_egress()
+# picks a new sticky exit (only meaningful with
+# config.LETTERBOXD_PROXY_COUNTRY) and bumps the version so thread-local
+# sessions rebuild.
 _egress_lock = threading.Lock()
 _egress = {"proxy": None, "ready": False, "version": 0}
 # Proxied exits that recently served a challenge-prone path (/csi/, /s/,
@@ -184,11 +174,7 @@ def _direct_session():
 def _drop_direct_session():
     sess = getattr(_local, "direct", None)
     _local.direct = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.close_quietly(sess)
 
 
 def _session():
@@ -208,25 +194,12 @@ def _session():
 
 
 def _drop_session():
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop(_local)
 
 
 def dump_debug(name, text):
     """Write a raw response to $LETTERBOXD_DEBUG_DIR/<name>.html."""
-    dbg = os.environ.get("LETTERBOXD_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".html"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("LETTERBOXD_DEBUG_DIR", name, text, ext=".html")
 
 
 def looks_blocked(resp):
@@ -237,125 +210,6 @@ def looks_blocked(resp):
         return False
     low = (resp.text or "")[:6000].lower()
     return any(m in low for m in CF_MARKERS)
-
-
-# ---- Cloudflare identity (fallback) ------------------------------------------------
-
-_identity = None           # {"cookies": dict, "ua": str, "egress": version}
-_harvest_failed_until = 0.0
-_identity_lock = threading.Lock()
-
-
-def _click_turnstile(page):
-    """Real mouse click on the Turnstile checkbox: the widget iframe's
-    bounding box, x at 1/9 of the width (the checkbox), y at the middle.
-    Returns True when a challenge frame was found and clicked."""
-    for frame in page.frames:
-        if not frame.url.startswith("https://challenges.cloudflare.com"):
-            continue
-        try:
-            box = frame.frame_element().bounding_box()
-        except Exception:
-            box = None
-        if not box or box.get("width", 0) < 50:
-            continue
-        x = box["x"] + box["width"] / 9 + random.uniform(-5, 5)
-        y = box["y"] + box["height"] / 2 + random.uniform(-5, 5)
-        page.mouse.move(x, y, steps=random.randint(10, 25))
-        page.wait_for_timeout(random.randint(100, 300))
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(50, 150))
-        page.mouse.up()
-        return True
-    return False
-
-
-def _cf_cookie(driver):
-    cookies = driver.call(lambda page: page.context.cookies(SITE))
-    return any(c.get("name") == "cf_clearance" for c in cookies), cookies
-
-
-def _harvest_identity(seed_path):
-    """One throwaway headed patchright Chrome loads the path Cloudflare
-    challenged (challenges are PATH-scoped: /films/popular/ can be open
-    while /<member>/ and /csi/… are challenged on the same exit) and waits
-    for a cf_clearance cookie; returns {cookies, ua}, validated over curl
-    on the same path and egress (cf_clearance is bound to IP + UA)."""
-    from curl_cffi import requests as curl_requests
-    from chrome_manager import create_scope
-    from patchright_driver import PatchrightDriver
-
-    proxy, _ = egress()
-    print(f"letterboxd: harvesting a Cloudflare identity on {seed_path} via patchright "
-          f"(proxy={'direct' if not proxy else proxy.rsplit('@', 1)[-1]})...")
-    with create_scope():
-        driver = PatchrightDriver(proxy_url=proxy, headless=False)
-    try:
-        try:
-            driver.goto(SITE + seed_path, referer="https://www.google.com/")
-        except Exception as e:
-            raise RuntimeError(f"seed navigation failed: {e}")
-        start = time.monotonic()
-        clicks, last_click = 0, None
-        while True:
-            cleared, cookies = _cf_cookie(driver)
-            title = (driver.title() or "").lower()
-            if cleared and "just a moment" not in title:
-                break
-            elapsed = time.monotonic() - start
-            if elapsed > HARVEST_CLEAR_TIMEOUT:
-                raise RuntimeError(f"Cloudflare challenge did not clear (clicks={clicks})")
-            due = (last_click is None and elapsed >= 3) or \
-                  (last_click is not None and time.monotonic() - last_click >= CLICK_EVERY)
-            if due and clicks < MAX_CLICKS and driver.call(_click_turnstile):
-                clicks += 1
-                last_click = time.monotonic()
-            time.sleep(HARVEST_POLL)
-        ua = driver.evaluate("navigator.userAgent")
-        cookies = {c["name"]: c["value"] for c in cookies}
-    finally:
-        driver.close()
-    with curl_requests.Session(impersonate=IMPERSONATE) as sess:
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        resp = sess.get(SITE + seed_path, headers={**HTML_HEADERS, "user-agent": ua},
-                        cookies=cookies, timeout=TIMEOUT)
-        if resp.status_code >= 500 or looks_blocked(resp):
-            raise RuntimeError(f"identity replay validation failed: HTTP {resp.status_code}")
-    print(f"letterboxd: Cloudflare identity ready ({len(cookies)} cookies, clicks={clicks}, "
-          f"{time.monotonic() - start:.0f}s)")
-    return {"cookies": cookies, "ua": ua}
-
-
-def _get_identity(seed_path):
-    global _identity, _harvest_failed_until
-    with _identity_lock:
-        if _identity is not None and _identity.get("egress") == egress()[1]:
-            return _identity
-        if time.time() < _harvest_failed_until:
-            raise LetterboxdBlocked("Cloudflare challenge; a recent identity harvest failed, "
-                                    "retrying after the cooldown")
-        last = None
-        for attempt in range(1, config.LETTERBOXD_HARVEST_ATTEMPTS + 1):
-            try:
-                _identity = _harvest_identity(seed_path)
-                _identity["egress"] = egress()[1]
-                return _identity
-            except Exception as e:
-                last = e
-                print(f"letterboxd: harvest attempt {attempt}/{config.LETTERBOXD_HARVEST_ATTEMPTS} failed: {e}")
-                if _proxied():
-                    rotate_egress()         # a fresh exit for the next attempt (and the replays)
-        # a failing harvest must not relaunch Chrome on every request
-        _harvest_failed_until = time.time() + config.LETTERBOXD_HARVEST_COOLDOWN
-        raise LetterboxdBlocked(f"Cloudflare challenge; identity harvest failed ({last})")
-
-
-def _invalidate_identity(stale):
-    global _identity
-    with _identity_lock:
-        if _identity is stale:
-            _identity = None
 
 
 # ---- requests ---------------------------------------------------------------------
@@ -405,17 +259,13 @@ def _block_direct(cls):
         _direct_blocked[cls] = time.time() + DIRECT_BLOCK_TTL
 
 
-def _once(path, params, ajax, identity, allow_redirects, direct=False):
+def _once(path, params, ajax, allow_redirects, direct=False):
     """One GET -> response, or None when Cloudflare challenged it."""
     headers = dict(AJAX_HEADERS if ajax else HTML_HEADERS)
-    cookies = None
-    if identity:
-        headers["user-agent"] = identity["ua"]
-        cookies = identity["cookies"]
     proxy, version = (None, None) if direct else egress()
     try:
         sess = _direct_session() if direct else _session()
-        resp = sess.get(_url(path), params=params, headers=headers, cookies=cookies,
+        resp = sess.get(_url(path), params=params, headers=headers,
                         timeout=TIMEOUT, allow_redirects=allow_redirects)
     except Exception as e:
         if direct:
@@ -437,16 +287,15 @@ def _fetch(path, params, ajax, allow_redirects):
     """GET with the Cloudflare ladder:
       0. proxied config: direct first for path classes not yet seen
          challenged on this IP (see path_class);
-      1. as-is (with the current identity if one is minted for this exit);
+      1. as-is on the current egress;
       2. proxied: a fresh residential exit per challenge, up to
          LETTERBOXD_ROTATE_ATTEMPTS times — Cloudflare scores exits by IP
-         reputation, and most US residential exits pass every path;
-      3. a patchright-minted identity on the current egress, once."""
+         reputation, and most US residential exits pass every path."""
     if _proxied():
         cls = path_class(path)
         if _direct_ok(cls):
             try:
-                resp = _once(path, params, ajax, None, allow_redirects, direct=True)
+                resp = _once(path, params, ajax, allow_redirects, direct=True)
             except LetterboxdUpstreamError:
                 resp = None
             else:
@@ -456,8 +305,7 @@ def _fetch(path, params, ajax, allow_redirects):
     rotations = 0
     while True:
         _, version = egress()
-        identity = _identity if _identity is not None and _identity.get("egress") == version else None
-        resp = _once(path, params, ajax, identity, allow_redirects)
+        resp = _once(path, params, ajax, allow_redirects)
         if resp is not None:
             return resp
         if _proxied() and rotations < config.LETTERBOXD_ROTATE_ATTEMPTS:
@@ -465,17 +313,7 @@ def _fetch(path, params, ajax, allow_redirects):
             rotate_egress(version)
             continue
         break
-    if not config.LETTERBOXD_CF_FALLBACK:
-        raise LetterboxdBlocked(f"Cloudflare challenge on {path}")
-    if identity is not None:
-        _invalidate_identity(identity)
-    seed = urlparse(_url(path)).path or "/"
-    identity = _get_identity(seed)
-    resp = _once(path, params, ajax, identity, allow_redirects)
-    if resp is not None:
-        return resp
-    _invalidate_identity(identity)
-    raise LetterboxdBlocked(f"Cloudflare challenge on {path} even with a fresh identity")
+    raise LetterboxdBlocked(f"Cloudflare challenge on {path}")
 
 
 def request(path, params=None, *, ajax=False, label=None, allow_redirects=True, missing=None):
@@ -528,13 +366,7 @@ def json_get(path, params=None, **kwargs):
 def run_parallel(fns, workers=FANOUT_WORKERS):
     """Run zero-arg callables in parallel; results align with `fns`.
     Exceptions propagate from the first failing call."""
-    if not fns:
-        return []
-    if len(fns) == 1:
-        return [fns[0]()]
-    with ThreadPoolExecutor(max_workers=min(workers, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
-        return [f.result() for f in futures]
+    return fanout.per_call(fns, workers)
 
 
 def run_parallel_quiet(fns, workers=FANOUT_WORKERS):

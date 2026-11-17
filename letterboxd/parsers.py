@@ -23,7 +23,7 @@ Upstream data dropped on purpose (and why):
 """
 import base64
 import html as html_lib
-import json
+import fastjson
 import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, unquote, urlparse
@@ -31,6 +31,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 from bs4 import BeautifulSoup
 
 from letterboxd import refs
+from scraper_utils.values import num as to_float, to_int
+from scraper_utils.text import stripped as text
+from scraper_utils.dates import iso_utc as iso_datetime
 
 SITE = refs.SITE
 _YEAR_SUFFIX_RE = re.compile(r"^(.*?)\s*\((\d{4})\)$")
@@ -42,35 +45,8 @@ _UID_RE = re.compile(r"(film|viewing|filmList|list):(\d+)")
 
 
 # ---- value helpers -------------------------------------------------------------
-# (kept local rather than imported from another site's package so this module
-# stands alone — the open-source kit ships it verbatim)
-
-def to_int(value):
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def text(value):
-    """Trimmed string or None ('' / whitespace -> None)."""
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    return value or None
-
-
-def iso_datetime(value):
-    """'2023-05-17T14:41:20.302Z' -> '2023-05-17T14:41:20Z' (UTC); junk -> None."""
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+# (the generic ones come from scraper_utils; the rest are kept local rather than
+# imported from another site's package)
 
 
 def soup(markup):
@@ -116,13 +92,6 @@ def count(value):
     elif suffix == "m":
         amount *= 1_000_000
     return int(round(amount))
-
-
-def to_float(value):
-    try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
 
 
 def stars(label):
@@ -231,7 +200,7 @@ def json_attr(node, name):
     if not raw:
         return {}
     try:
-        value = json.loads(html_lib.unescape(raw))
+        value = fastjson.loads(html_lib.unescape(raw))
         return value if isinstance(value, dict) else {}
     except ValueError:
         return {}
@@ -536,7 +505,7 @@ def ld_json(doc):
         return {}
     raw = re.sub(r"/\*.*?\*/", "", node.string, flags=re.S).strip()
     try:
-        data = json.loads(raw)
+        data = fastjson.loads(raw)
         return data if isinstance(data, dict) else {}
     except ValueError:
         return {}
@@ -1420,7 +1389,7 @@ def _decode_cx(view_url):
     if raw:
         try:
             padded = raw + "=" * (-len(raw) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8", "replace"))
+            payload = fastjson.loads(base64.urlsafe_b64decode(padded).decode("utf-8", "replace"))
             for ctx in payload.get("data") or []:
                 data = ctx.get("data") or {}
                 if "currency" in data or "price" in data:
